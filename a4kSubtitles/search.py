@@ -306,7 +306,14 @@ def __prepare_results(core, meta, results):
     return results
 
 def __parse_languages(core, languages):
-    return list({language for language in (core.kodi.parse_language(x) for x in languages) if language is not None})
+    # Normalize to the same canonical English name every provider's result
+    # gets tagged with (core.utils.get_lang_id(..., ENGLISH_NAME) in each
+    # services/*.py parse_search_response). Kodi can report regional variants
+    # like "Spanish (Mexico)" that never match a result's plain "Spanish" -
+    # __apply_language_filter would silently drop every matching result.
+    parsed = (core.kodi.parse_language(x) for x in languages if x is not None)
+    normalized = (core.utils.get_lang_id(x, core.kodi.xbmc.ENGLISH_NAME) for x in parsed if x is not None)
+    return list({language for language in normalized if language})
 
 def __chain_auth_and_search_threads(core, auth_thread, search_thread):
     auth_thread.start()
@@ -324,7 +331,10 @@ def __wait_threads(core, request_threads):
             thread = core.threading.Thread(target=__chain_auth_and_search_threads, args=(core, auth_thread, search_thread))
             threads.append(thread)
 
-    core.utils.wait_threads(threads)
+    # A hard cap so one slow/misbehaving provider (BSPlayer's polling loop is
+    # the known offender) can't block every other provider's results forever
+    # and leave Kodi's subtitle dialog hanging with nothing shown.
+    core.utils.wait_threads(threads, timeout=15)
 
 def __complete_search(core, results, meta):
     if core.api_mode_enabled:
@@ -344,18 +354,42 @@ def __search(core, service_name, meta, results):
 
     core.utils.wait_threads(threads)
 
-def search(core, params):
-    meta = core.video.get_meta(core)
-    core.last_meta = meta
+__imdb_id_pattern = None
 
-    meta.languages = __parse_languages(core, core.utils.unquote(params['languages']).split(','))
-    meta.preferredlanguage = core.kodi.parse_language(params['preferredlanguage'])
-    core.logger.debug(lambda: core.json.dumps(meta, default=lambda o: '', indent=2))
+def __apply_manual_search_query(core, meta, query):
+    # A manual search overrides whatever title/imdb metadata Kodi (or our own
+    # IMDB scraping) came up with. This is the escape hatch for content that
+    # has no (or a wrong) IMDB match, e.g. anime, so providers that can search
+    # by plain text (OpenSubtitles, Podnadpisi, SubDL, ...) still get a query.
+    #
+    # If the user typed an actual IMDB id (e.g. tt1234567 - either the show's
+    # or the specific episode's), resolve real metadata from it instead of
+    # treating it as free text. This is what lets providers that require a
+    # genuine IMDB id (BSPlayer, SubDL movies, Subsource) work too.
+    global __imdb_id_pattern
+    if __imdb_id_pattern is None:
+        __imdb_id_pattern = core.re.compile(r'^tt\d{7,}$', core.re.IGNORECASE)
 
-    if meta.imdb_id == '':
-        core.logger.error('missing imdb id!')
-        core.kodi.notification('IMDB ID is not provided')
-        return
+    query = query.strip()
+    if __imdb_id_pattern.match(query):
+        return core.video.apply_manual_imdb_id(core, meta, query.lower())
+
+    # Important: keep whatever is_tvshow/season/episode info was already
+    # detected (from the filename or the library). Forcing everything to
+    # "movie" breaks TV/anime episode matching entirely - providers would
+    # search for a movie called "<query> <year>" instead of "<query> SxxEyy".
+    meta.imdb_id = ''
+    meta.tv_show_imdb_id = ''
+    meta.imdb_id_as_int = ''
+    if meta.is_tvshow:
+        meta.tvshow = query
+    else:
+        meta.title = query
+        meta.filename_without_ext = query
+    return meta
+
+def __run_search_threads(core, meta):
+    core.progress_text = ''
 
     threads = []
     (results, force_search) = __get_last_results(core, meta)
@@ -379,7 +413,7 @@ def search(core, params):
         threads.append((auth_thread, search_thread))
 
     if len(threads) == 0:
-        return __complete_search(core, results, meta)
+        return (results, False)
 
     core.progress_text = core.progress_text[:-1]
     core.kodi.update_progress(core)
@@ -397,18 +431,84 @@ def search(core, params):
 
             cancellation_token.iscanceled = True
             final_results = __prepare_results(core, meta, results)
-            ready_queue.put(__complete_search(core, final_results, meta))
+            ready_queue.put((final_results, True))
             break
 
     def wait_all_results():
-        __wait_threads(core, threads)
-        if cancellation_token.iscanceled:
-            return
-        final_results = __prepare_results(core, meta, results)
-        __save_results(core, meta, final_results)
-        ready_queue.put(__complete_search(core, final_results, meta))
+        try:
+            __wait_threads(core, threads)
+            if cancellation_token.iscanceled:
+                return
+            final_results = __prepare_results(core, meta, results)
+            core.logger.debug(lambda: 'search finished with %d result(s)' % len(final_results))
+            __save_results(core, meta, final_results)
+            ready_queue.put((final_results, False))
+        except Exception as exc:
+            # Never let an unexpected exception here hang the search forever -
+            # Kodi's subtitles dialog would just sit there with nothing
+            # happening and no error shown. Log it and surface whatever
+            # results we already had instead.
+            import traceback
+            core.logger.error('search - unexpected error while finishing up: %s' % exc)
+            core.logger.error(traceback.format_exc())
+            ready_queue.put((results, False))
 
     core.threading.Thread(target=check_cancellation).start()
     core.threading.Thread(target=wait_all_results).start()
 
     return ready_queue.get()
+
+def __toggle_manual_search_type(meta):
+    # Flip the movie/tvshow guess for a manual free-text query. That guess
+    # comes from whatever Kodi/get_meta() detected *before* the manual
+    # override (__apply_manual_search_query keeps it as-is on purpose), and
+    # unlike apply_manual_imdb_id there's no real IMDB data here to confirm
+    # the actual type against - so if it was wrong, every provider ends up
+    # building the wrong kind of query and finds nothing.
+    meta.is_tvshow = not meta.is_tvshow
+    meta.is_movie = not meta.is_tvshow
+    if meta.is_tvshow:
+        meta.tvshow = meta.title or meta.tvshow
+        meta.title = ''
+    else:
+        meta.title = meta.tvshow or meta.title
+        meta.tvshow = ''
+    return meta
+
+def search(core, params):
+    meta = core.video.get_meta(core)
+    core.last_meta = meta
+
+    manual_search_query = params.get('manual_search_query', '')
+    if manual_search_query:
+        meta = __apply_manual_search_query(core, meta, manual_search_query)
+
+    meta.languages = __parse_languages(core, core.utils.unquote(params['languages']).split(','))
+    meta.preferredlanguage = core.kodi.parse_language(params['preferredlanguage'])
+    core.logger.debug(lambda: core.json.dumps(meta, default=lambda o: '', indent=2))
+
+    # Some providers (Addic7ed, BSPlayer, Subsource...) hard-depend on an IMDB
+    # id and will just return no results without one - that's fine. What we
+    # don't want is to abort the whole search just because IMDB matching
+    # failed, since providers like OpenSubtitles/Podnadpisi/SubDL can search
+    # by plain title text instead.
+    if meta.imdb_id == '' and meta.title == '' and meta.tvshow == '':
+        core.logger.error('missing imdb id and title/tvshow - nothing to search with!')
+        core.kodi.notification('No metadata to search with')
+        return
+
+    (final_results, cancelled) = __run_search_threads(core, meta)
+
+    # Retrying needs a season/episode pair to search a tvshow with - without
+    # one (e.g. a plain movie title with no episode info anywhere) flipping to
+    # tvshow mode would just make every tvshow-aware provider blow up on an
+    # empty season/episode number instead of finding anything.
+    can_flip_to_tvshow = meta.is_tvshow or (meta.season != '' and meta.episode != '')
+
+    if not cancelled and manual_search_query and meta.imdb_id == '' and len(final_results) == 0 and can_flip_to_tvshow:
+        core.logger.debug(lambda: 'manual search - no results as %s, retrying as %s' % (
+            'tvshow' if meta.is_tvshow else 'movie', 'movie' if meta.is_tvshow else 'tvshow'))
+        meta = __toggle_manual_search_type(meta)
+        (final_results, cancelled) = __run_search_threads(core, meta)
+
+    return __complete_search(core, final_results, meta)

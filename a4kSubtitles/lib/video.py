@@ -369,6 +369,36 @@ def __get_basic_info(core):
 def __is_imdb_id(id: str) -> bool:
     return id.startswith(__imdb_id_prefix)
 
+def is_imdb_id(id: str) -> bool:
+    return id != '' and __is_imdb_id(id)
+
+def apply_manual_imdb_id(core, meta, imdb_id):
+    # Lets a manual search hand us a real IMDB id directly (either the
+    # episode's own id, or the show's id - __update_info_from_imdb resolves
+    # the right episode using meta.season/meta.episode in that second case).
+    # This is the one path that also satisfies providers like BSPlayer/SubDL
+    # movies/Subsource that require a genuine IMDB id and won't work off a
+    # plain text query.
+    meta.imdb_id = imdb_id
+    meta.tv_show_imdb_id = imdb_id
+    __update_info_from_imdb(core, meta)
+
+    # meta.is_tvshow was already decided by get_meta() from whatever Kodi
+    # reported *before* this manual id was resolved (e.g. '' for an unscraped
+    # source), so it can be stale now that __update_info_from_imdb may have
+    # just populated meta.tvshow from a real episode id. Recompute it here -
+    # otherwise every provider builds a movie-style query/request for what is
+    # actually a tv episode, and searches silently return nothing.
+    meta.is_tvshow = meta.tvshow != ''
+    meta.is_movie = not meta.is_tvshow
+
+    try:
+        if len(meta.imdb_id) > 2:
+            meta.imdb_id_as_int = int(meta.imdb_id[2:].lstrip('0'))
+    except: pass
+
+    return meta
+
 def get_meta(core):
     meta = __get_basic_info(core)
 

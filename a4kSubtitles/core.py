@@ -48,7 +48,16 @@ def main(handle, paramstring):  # pragma: no cover
 
     params = dict(utils.parse_qsl(paramstring))
     if params['action'] == 'manualsearch':
-        kodi.notification('Manual search is not supported')
+        params['manual_search_query'] = utils.unquote(params.get('searchstring', ''))
+
+        core.progress_text = ''
+        core.progress_dialog = kodi.get_progress_dialog()
+
+        try:
+            search(core, params)
+        finally:
+            core.progress_dialog.close()
+            core.progress_dialog = None
     elif params['action'] == 'search':
         core.progress_text = ''
         core.progress_dialog = kodi.get_progress_dialog()

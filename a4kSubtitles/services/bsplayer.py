@@ -24,13 +24,33 @@ __subdomains = [1, 2, 3, 4, 5, 6, 7, 8, 101, 102, 103, 104, 105, 106, 107, 108, 
 def __get_url(core, service_name):
     context = core.services[service_name].context
     if not context.subdomain:
+        failed = context.failed_subdomains or []
+        available = [s for s in __subdomains if s not in failed] or __subdomains
+        if not available:
+            available = __subdomains
+
         time_seconds = core.datetime.now().second
-        context.subdomain = __subdomains[time_seconds % len(__subdomains)]
+        context.subdomain = available[time_seconds % len(available)]
 
     return "http://s%s.api.bsplayer-subtitles.com/v1.php" % context.subdomain
 
+def __mark_subdomain_failed(core, service_name):
+    # context.subdomain is picked once and reused for as long as this Python
+    # invoker stays alive (addon.xml has reuselanguageinvoker=true), so every
+    # search in the session keeps hitting the same mirror. If that mirror is
+    # down, that means every search silently gets nothing from BSPlayer until
+    # Kodi restarts. Blacklist it and force the next search to pick another.
+    context = core.services[service_name].context
+    failed = context.failed_subdomains or []
+    if context.subdomain is not None and context.subdomain not in failed:
+        failed = failed + [context.subdomain]
+    context.failed_subdomains = failed
+    context.subdomain = None
+
 def __validate_response(core, service_name, request, response, retry=True):
     if not retry:
+        if response is None or response.status_code != 200:
+            __mark_subdomain_failed(core, service_name)
         return None
 
     def get_retry_request():

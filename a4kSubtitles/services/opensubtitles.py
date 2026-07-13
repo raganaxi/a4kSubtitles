@@ -151,7 +151,12 @@ def parse_search_response(core, service_name, meta, response):
     def map_result(result):
         result = result['attributes']
         imdb_id = result.get('feature_details', {}).get('imdb_id', None)
-        if len(result['files']) == 0 or imdb_id is not None and imdb_id != meta.imdb_id_as_int:
+        # Only enforce the imdb match when we actually have a reliable imdb id
+        # for our side (meta.imdb_id_as_int). Without one - manual search, or
+        # automatic IMDB lookup failing (common for anime) - fall back to
+        # trusting the title-based query/ranking instead of dropping everything.
+        has_reliable_imdb_id = bool(meta.imdb_id_as_int)
+        if len(result['files']) == 0 or (has_reliable_imdb_id and imdb_id is not None and imdb_id != meta.imdb_id_as_int):
             return None
 
         filename = result['files'][0]['file_name']

@@ -87,7 +87,15 @@ def get_lang_ids(languages, lang_format=kodi.xbmc.ISO_639_2):
                     lang_ids.append('Portuguese (Brazil)')
                 continue
 
-            lang = iso639.Lang(language)
+            try:
+                lang = iso639.Lang(language)
+            except Exception:
+                # Kodi can report regional variants iso639 has no entry for
+                # (e.g. "Spanish (Mexico)", "English (US)") - fall back to
+                # just the base language name rather than losing the language
+                # entirely (which used to silently empty out meta.languages).
+                base_language = re.sub(r'\s*\([^)]*\)\s*$', '', language).strip()
+                lang = iso639.Lang(base_language)
 
             lang_id = None
             if lang_format == kodi.xbmc.ISO_639_1:
@@ -112,11 +120,18 @@ def get_subfile_from_temp_dir():
             return os.path.join(temp_dir, file.strip())
     return None
 
-def wait_threads(threads):
+def wait_threads(threads, timeout=None):
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join()
+        thread.join(timeout)
+        # A single slow/stuck provider (BSPlayer's polling loop is the usual
+        # culprit) must not be able to block every other provider's results
+        # forever. If it's still alive past the timeout, stop waiting on it
+        # and move on with whatever the other threads already found.
+        if timeout is not None and thread.is_alive():
+            from . import logger
+            logger.error('wait_threads - thread %s did not finish within %ss, giving up on it' % (thread.name, timeout))
 
 def get_any_of_regex(array):
     regex = r'('

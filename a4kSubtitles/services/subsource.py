@@ -155,18 +155,24 @@ def build_search_requests(core, service_name, meta):
 
     name = (meta.title if meta.is_movie else meta.tvshow)
     year = meta.tvshow_year if meta.is_tvshow else meta.year
+    imdb_id = meta.tv_show_imdb_id if meta.is_tvshow else meta.imdb_id
 
-    text_search = {"searchType": "text", "q": name, "year": year, "type": "tvseries" if meta.is_tvshow else "movie"}
-    imdb_search = {"searchType": "imdb", "imdb": meta.tv_show_imdb_id if meta.is_tvshow else meta.imdb_id}
+    # Prefer a single imdb-based lookup when we have a real id - it's more
+    # precise and halves the requests fired per search. Only fall back to a
+    # text search when there's no id to search with (e.g. manual free text).
+    if imdb_id:
+        params = {"searchType": "imdb", "imdb": imdb_id}
+    else:
+        params = {"searchType": "text", "q": name, "year": year, "type": "tvseries" if meta.is_tvshow else "movie"}
 
-    request = lambda params: {
+    request = {
         "method": "GET",
         "url": __search,
         "params": params,
         "headers": headers,
         "next": lambda gm: get_movie(gm)
     }
-    return [request(text_search), request(imdb_search)]
+    return [request]
 
 
 def parse_search_response(core, service_name, meta, response):

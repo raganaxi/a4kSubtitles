@@ -177,7 +177,7 @@ def test_search_missing_imdb_id():
     a4ksubtitles_api.search(params, {}, {})
 
     log_error_spy.restore()
-    log_error_spy.called_with('missing imdb id!')
+    log_error_spy.called_with('missing imdb id and title/tvshow - nothing to search with!')
 
 def test_tvshow_year_scraping_with_episode_imdb_id():
     a4ksubtitles_api = api.A4kSubtitlesApi({'kodi': True})
